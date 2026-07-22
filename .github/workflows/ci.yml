@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DODDS_WERROR=ON
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Unit tests
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Generate session and verify invariants
+        run: |
+          mkdir -p data
+          ./build/odds_sim --seed 42 --markets 5 --ticks 5000 --out data/ci.bin
+          ./build/verify_session data/ci.bin
+
+      - name: Replay determinism
+        run: |
+          ./build/odds_sim --seed 42 --markets 5 --ticks 5000 --out data/det_a.bin
+          ./build/odds_sim --seed 42 --markets 5 --ticks 5000 --out data/det_b.bin
+          ./build/odds_sim --seed 43 --markets 5 --ticks 5000 --out data/det_c.bin
+          cmp data/det_a.bin data/det_b.bin
+          if cmp -s data/det_a.bin data/det_c.bin; then
+            echo "different seeds produced identical output"; exit 1
+          fi

@@ -2,17 +2,24 @@
 #include <cstdint>
 
 // Fixed-size, trivially-copyable wire message for one book's quote on one market.
-// Exactly one cache line (64 bytes) by design — see docs/notes.md.
+// Exactly one cache line by design: a message never straddles two lines, and
+// adjacent messages cannot false-share once producer and consumer are on
+// different cores.
 struct alignas(64) OddsUpdate {
-    uint64_t seq_no;          // 8 bytes, monotonically increasing per book
-    uint64_t sim_timestamp_ns;// 8 bytes, simulated nanosecond timestamp
-    uint16_t book_id;         // 2 bytes
-    uint16_t market_id;       // 2 bytes
-    uint8_t  outcome_count;   // 1 byte, e.g. 2 (moneyline) or 3 (1X2)
-    uint8_t  _pad0[3];        // explicit padding to keep odds_milli 4-byte aligned
-    uint32_t odds_milli[4];   // 16 bytes, decimal odds * 1000 per outcome (unused slots = 0)
-    uint8_t  _pad1[24];       // pad out the remainder to fill the 64-byte cache line
+    uint64_t seq_no;
+    uint64_t sim_timestamp_ns;
+    uint16_t book_id;
+    uint16_t market_id;
+    uint8_t  outcome_count;
+    uint8_t  _pad0[3];
+    uint32_t odds_milli[4];   // decimal odds x 1000; slots >= outcome_count are zero
+    uint8_t  _pad1[24];
 };
 
 static_assert(sizeof(OddsUpdate) == 64, "OddsUpdate must be exactly one cache line");
 static_assert(alignof(OddsUpdate) == 64, "OddsUpdate must be 64-byte aligned");
+
+// market_id and book_id are uint16_t on the wire, so these are hard ceilings,
+// not tuning parameters.
+inline constexpr uint32_t kMaxMarketsSupported = 65535;
+inline constexpr uint32_t kMaxBooksSupported   = 65535;

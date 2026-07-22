@@ -23,3 +23,9 @@ static_assert(alignof(OddsUpdate) == 64, "OddsUpdate must be 64-byte aligned");
 // not tuning parameters.
 inline constexpr uint32_t kMaxMarketsSupported = 65535;
 inline constexpr uint32_t kMaxBooksSupported   = 65535;
+
+// Shared between sim/main.cpp (which advances simulated time by this amount
+// per tick) and tools/validate_devig.cpp (which must invert that mapping to
+// recover the tick index from a wire timestamp). Defined once here so the two
+// can never drift apart.
+inline constexpr uint64_t kTickIntervalNs = 100'000'000ULL; // 100 ms

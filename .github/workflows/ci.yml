@@ -35,3 +35,15 @@ jobs:
           if cmp -s data/det_a.bin data/det_c.bin; then
             echo "different seeds produced identical output"; exit 1
           fi
+
+      - name: Engine replay determinism
+        run: |
+          ./build/odds_sim --seed 42 --markets 5 --ticks 5000 --out data/e_a.bin
+          ./build/odds_sim --seed 42 --markets 5 --ticks 5000 --out data/e_b.bin
+          ./build/odds_sim --seed 43 --markets 5 --ticks 5000 --out data/e_c.bin
+          H1=$(./build/odds_engine --in data/e_a.bin --hash)
+          H2=$(./build/odds_engine --in data/e_b.bin --hash)
+          H3=$(./build/odds_engine --in data/e_c.bin --hash)
+          echo "seed42=$H1 seed42=$H2 seed43=$H3"
+          test "$H1" = "$H2" || { echo "same seed produced different engine digest"; exit 1; }
+          test "$H1" != "$H3" || { echo "different seeds produced identical engine digest"; exit 1; }

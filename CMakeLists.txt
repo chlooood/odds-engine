@@ -13,7 +13,9 @@ if(ODDS_WERROR)
 endif()
 
 add_executable(odds_sim sim/main.cpp)
+add_executable(odds_engine engine/main.cpp)
 add_executable(verify_session tools/verify_session.cpp)
+add_executable(validate_devig tools/validate_devig.cpp)
 add_executable(scratch_latent tests/scratch_latent.cpp)
 add_executable(scratch_books  tests/scratch_books.cpp)
 
@@ -29,7 +31,10 @@ add_executable(unit_tests
     tests/test_wire_format.cpp
     tests/test_seeding.cpp
     tests/test_latent.cpp
+  tests/test_replay_hash.cpp
     tests/test_bookmaker.cpp
+  tests/test_book_table.cpp
+  tests/test_consensus.cpp
     tests/test_devig.cpp
 )
 target_link_libraries(unit_tests PRIVATE Catch2::Catch2WithMain)

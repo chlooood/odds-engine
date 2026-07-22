@@ -14,12 +14,7 @@
 
 namespace {
 
-// Simulated time advances a fixed amount per tick. Deliberately not wall-clock:
-// reading the system clock would make output differ between runs and destroy
-// the replay-hash regression test.
-constexpr uint64_t kTickIntervalNs = 100'000'000ULL; // 100 ms
-
-// update_interval_ticks models feed throttling — recreational books publish
+// update_interval_ticks models feed throttling - recreational books publish
 // less often than sharp ones, which compounds with lag to widen the gap.
 struct SimBookConfig {
     BookConfig cfg;
@@ -37,6 +32,19 @@ const std::vector<SimBookConfig>& default_roster() {
     return roster;
 }
 
+// The calibration roster: a single book at zero lag and zero pricing noise,
+// updating every tick. Its only source of quoted error is the vig model
+// itself, which is what validate_devig needs to isolate devig accuracy from
+// staleness and noise. See docs/validation-experiment.md for why this is a
+// separate roster rather than a --lag 0 flag on the default one: the default
+// roster's five books exist to demonstrate feed heterogeneity, and forcing
+// all five to zero lag/noise would silently change what they're modeling.
+const std::vector<SimBookConfig>& calibration_roster(VigModel model) {
+    static std::vector<SimBookConfig> roster;
+    roster = { { {0, 0, 0.060, 0.0, 1.08, model}, 1 } };
+    return roster;
+}
+
 // Opening lines vary per market so the session isn't five copies of one match.
 std::array<double, LatentMarket::kOutcomes> opening_line(uint64_t master, uint32_t market_id) {
     uint64_t h = derive_seed(master, 99, market_id);
@@ -47,12 +55,23 @@ std::array<double, LatentMarket::kOutcomes> opening_line(uint64_t master, uint32
     return {home, draw, away};
 }
 
+bool parse_vig_model(const std::string& s, VigModel& out) {
+    if (s == "power")        { out = VigModel::Power;        return true; }
+    if (s == "additive")     { out = VigModel::Additive;     return true; }
+    if (s == "proportional") { out = VigModel::Proportional; return true; }
+    return false;
+}
+
 struct Options {
     uint64_t seed = 42;
     uint32_t markets = 5;
     uint64_t ticks = 10000;
     std::string out = "data/session.bin";
     std::string truth_out; // empty = don't record truth
+    VigModel vig_model = VigModel::Power;
+    bool vig_model_set = false; // distinguishes "not given" from "given as power"
+    bool calibration = false;
+    bool help = false;
 };
 
 bool parse_args(int argc, char** argv, Options& opt) {
@@ -67,9 +86,29 @@ bool parse_args(int argc, char** argv, Options& opt) {
         else if (a == "--ticks")   { auto v = next("--ticks");   if (!v) return false; opt.ticks = std::strtoull(v, nullptr, 10); }
         else if (a == "--out")     { auto v = next("--out");     if (!v) return false; opt.out = v; }
         else if (a == "--truth")   { auto v = next("--truth");   if (!v) return false; opt.truth_out = v; }
+        else if (a == "--vig-model") {
+            auto v = next("--vig-model"); if (!v) return false;
+            if (!parse_vig_model(v, opt.vig_model)) {
+                std::fprintf(stderr, "unknown --vig-model: %s (expected power|additive|proportional)\n", v);
+                return false;
+            }
+            opt.vig_model_set = true;
+        }
+        else if (a == "--calibration") { opt.calibration = true; }
         else if (a == "--help") {
-            std::printf("usage: odds_sim [--seed N] [--markets N] [--ticks N] [--out PATH] [--truth PATH]\n");
-            return false;
+            opt.help = true;
+            std::printf("usage: odds_sim [--seed N] [--markets N] [--ticks N] [--out PATH] [--truth PATH]\n"
+                        "                 [--vig-model power|additive|proportional] [--calibration]\n"
+                        "\n"
+                        "  --vig-model    applies the chosen shading model to every book in the roster\n"
+                        "                 (default: each book keeps its per-roster default, which is\n"
+                        "                 Power). Ignored on its own for anything but comparing devig\n"
+                        "                 accuracy across models; see docs/validation-experiment.md.\n"
+                        "  --calibration  replaces the roster with a single book at zero lag and zero\n"
+                        "                 pricing noise, updating every tick. Required for a clean devig\n"
+                        "                 accuracy measurement - without it, measured error also includes\n"
+                        "                 staleness and per-book noise.\n");
+            return true; // caller checks opt.help and exits 0, not an error
         } else {
             std::fprintf(stderr, "unknown argument: %s\n", a.c_str());
             return false;
@@ -96,8 +135,21 @@ struct MarketSim {
 int main(int argc, char** argv) {
     Options opt;
     if (!parse_args(argc, argv, opt)) return 1;
+    if (opt.help) return 0;
 
-    const auto& roster = default_roster();
+    // Build the effective roster: calibration mode overrides the roster
+    // entirely; --vig-model without --calibration overrides only the vig
+    // model field of the default roster, keeping each book's lag/noise/
+    // overround/skew as tuned.
+    std::vector<SimBookConfig> roster;
+    if (opt.calibration) {
+        roster = calibration_roster(opt.vig_model_set ? opt.vig_model : VigModel::Power);
+    } else {
+        roster = default_roster();
+        if (opt.vig_model_set) {
+            for (auto& b : roster) b.cfg.vig_model = opt.vig_model;
+        }
+    }
 
     // All state is sized and allocated before the generation loop begins.
     // Nothing allocates inside it.

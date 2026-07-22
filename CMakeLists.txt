@@ -30,6 +30,7 @@ add_executable(unit_tests
     tests/test_seeding.cpp
     tests/test_latent.cpp
     tests/test_bookmaker.cpp
+    tests/test_devig.cpp
 )
 target_link_libraries(unit_tests PRIVATE Catch2::Catch2WithMain)
 

@@ -36,6 +36,7 @@ add_executable(unit_tests
   tests/test_book_table.cpp
   tests/test_consensus.cpp
     tests/test_devig.cpp
+  tests/test_kelly.cpp
 )
 target_link_libraries(unit_tests PRIVATE Catch2::Catch2WithMain)
 

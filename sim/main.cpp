@@ -10,6 +10,7 @@
 #include "Bookmaker.hpp"
 #include "LatentMarket.hpp"
 #include "OutputSink.hpp"
+#include "JumpSink.hpp"
 #include "Seeding.hpp"
 #include "SettlementSink.hpp"
 #include "TruthSink.hpp"
@@ -47,6 +48,7 @@ struct Options {
     std::string out = "data/session.bin";
     std::string truth_out;
     std::string settle_out;   // NEW: empty = don't record settlement
+    std::string jumps_out;    // NEW: empty = don't record jump timeline
 };
 
 bool parse_args(int argc, char** argv, Options& opt) {
@@ -62,8 +64,9 @@ bool parse_args(int argc, char** argv, Options& opt) {
         else if (a == "--out")      { auto v = next("--out");     if (!v) return false; opt.out = v; }
         else if (a == "--truth")    { auto v = next("--truth");   if (!v) return false; opt.truth_out = v; }
         else if (a == "--settle")   { auto v = next("--settle");  if (!v) return false; opt.settle_out = v; }
+        else if (a == "--jumps")    { auto v = next("--jumps");   if (!v) return false; opt.jumps_out = v; }
         else if (a == "--help") {
-            std::printf("usage: odds_sim [--seed N] [--markets N] [--ticks N] [--out PATH] [--truth PATH] [--settle PATH]\n");
+            std::printf("usage: odds_sim [--seed N] [--markets N] [--ticks N] [--out PATH] [--truth PATH] [--settle PATH] [--jumps PATH]\n");
             return false;
         } else { std::fprintf(stderr, "unknown argument: %s\n", a.c_str()); return false; }
     }
@@ -106,9 +109,11 @@ int main(int argc, char** argv) {
 
     std::unique_ptr<FileSink> sink;
     std::unique_ptr<TruthSink> truth;
+    std::unique_ptr<JumpSink> jumps;
     try {
         sink = std::make_unique<FileSink>(opt.out, header);
         if (!opt.truth_out.empty()) truth = std::make_unique<TruthSink>(opt.truth_out);
+        if (!opt.jumps_out.empty()) jumps = std::make_unique<JumpSink>(opt.jumps_out, opt.seed, opt.markets);
     } catch (const std::exception& e) { std::fprintf(stderr, "error: %s\n", e.what()); return 1; }
 
     std::vector<uint64_t> seq_no(roster.size(), 0);
@@ -127,6 +132,7 @@ int main(int argc, char** argv) {
                 auto& sim = sims[m];
                 const auto latent = sim.latent.step();
                 final_latent[m] = latent;
+                if (jumps && sim.latent.jumped()) jumps->accept(static_cast<uint16_t>(m), tick);
 
                 if (truth) {
                     truth_rec = TruthRecord{};
@@ -154,6 +160,7 @@ int main(int argc, char** argv) {
 
         sink->finish();
         if (truth) truth->finish();
+        if (jumps) jumps->finish();
 
         if (!opt.settle_out.empty()) {
             SettlementSink settle(opt.settle_out, opt.seed, opt.markets);

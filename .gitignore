@@ -1,2 +1,5 @@
 build/
 data/*.bin
+data/*.settle
+data/*.jumps
+data/*.bets

@@ -55,3 +55,16 @@ jobs:
           ./build/odds_sim --seed 42 --markets 5 --ticks 2000 --out data/tee_on.bin \
             --udp 127.0.0.1:9999
           cmp data/tee_off.bin data/tee_on.bin
+
+      - name: Pacing does not perturb the session file
+        run: |
+          mkdir -p data
+          ./build/odds_sim --seed 42 --markets 5 --ticks 200 --out data/pace_off.bin
+          ./build/odds_sim --seed 42 --markets 5 --ticks 200 --out data/pace_on.bin --pace 500
+          cmp data/pace_off.bin data/pace_on.bin
+
+      - name: Engine refuses --hash on a lossy feed
+        run: |
+          if ./build/odds_engine --listen 9100 --hash; then
+            echo "engine accepted --hash with --listen"; exit 1
+          fi

@@ -84,8 +84,10 @@ int main(int argc, char** argv) {
 
     std::vector<uint8_t> buf(kMaxDatagramBytes);
     uint64_t datagrams = 0, records = 0, expected_seq = 0;
-    uint64_t gaps = 0, reordered = 0, malformed = 0;
+    uint64_t gaps = 0, reordered = 0, malformed = 0, announces = 0;
     uint32_t max_market = 0, max_book = 0;
+    uint64_t ann_seed = 0; uint32_t ann_markets = 0, ann_books = 0;
+    bool have_announce = false;
 
     std::printf("listening on port %u (exits after %ld ms of silence)\n", port, idle_ms);
     std::fflush(stdout);
@@ -107,13 +109,27 @@ int main(int argc, char** argv) {
         UdpDatagramHeader h{};
         std::memcpy(&h, buf.data(), sizeof(h));
         if (h.magic != kUdpMagic || h.version != kUdpVersion) { ++malformed; continue; }
-        if (h.record_count == 0 || h.record_count > kRecordsPerDatagram) { ++malformed; continue; }
-        const size_t want = sizeof(h) + static_cast<size_t>(h.record_count) * sizeof(OddsUpdate);
+        if (h.record_count == 0) { ++malformed; continue; }
+        const bool is_announce = (h.type == static_cast<uint8_t>(UdpDatagramType::Announce));
+        if (!is_announce && h.record_count > kRecordsPerDatagram) { ++malformed; continue; }
+        const size_t want = is_announce
+            ? sizeof(h) + sizeof(AnnounceRecord)
+            : sizeof(h) + static_cast<size_t>(h.record_count) * sizeof(OddsUpdate);
         if (static_cast<size_t>(n) != want) { ++malformed; continue; }
 
         if (h.datagram_seq > expected_seq)      { gaps += h.datagram_seq - expected_seq; expected_seq = h.datagram_seq + 1; }
         else if (h.datagram_seq < expected_seq) { ++reordered; }
         else                                    { ++expected_seq; }
+
+        if (is_announce) {
+            AnnounceRecord a{};
+            std::memcpy(&a, buf.data() + sizeof(h), sizeof(a));
+            ann_seed = a.seed; ann_markets = a.markets; ann_books = a.books;
+            have_announce = true;
+            ++announces;
+            ++datagrams;
+            continue;
+        }
 
         for (uint16_t r = 0; r < h.record_count; ++r) {
             OddsUpdate u{};
@@ -131,10 +147,16 @@ int main(int argc, char** argv) {
     ::close(fd);
 
     if (out) {
-        // Patch what the wire actually told us. seed and ticks stay zero: they
-        // are sender-side config, not stream content, and inventing them would
-        // make the capture look more authoritative than it is.
-        const uint32_t markets = max_market + 1, books = max_book + 1;
+        // Patch what the wire actually told us. markets/books/seed now come
+        // from the announce when one was seen, falling back to observation
+        // otherwise. ticks stays zero: a stream has no length, and inventing
+        // one would make the capture look more authoritative than it is.
+        const uint32_t markets = have_announce ? ann_markets : max_market + 1;
+        const uint32_t books   = have_announce ? ann_books   : max_book + 1;
+        if (have_announce) {
+            std::fseek(out, static_cast<long>(offsetof(SessionHeader, seed)), SEEK_SET);
+            std::fwrite(&ann_seed, sizeof(ann_seed), 1, out);
+        }
         std::fseek(out, static_cast<long>(offsetof(SessionHeader, markets)), SEEK_SET);
         std::fwrite(&markets, sizeof(markets), 1, out);
         std::fseek(out, static_cast<long>(offsetof(SessionHeader, books)), SEEK_SET);
@@ -144,13 +166,19 @@ int main(int argc, char** argv) {
         std::fclose(out);
     }
 
-    std::printf("received %llu datagrams, %llu records\n",
-                (unsigned long long)datagrams, (unsigned long long)records);
+    std::printf("received %llu datagrams (%llu announces), %llu records\n",
+                (unsigned long long)datagrams, (unsigned long long)announces,
+                (unsigned long long)records);
+    if (have_announce)
+        std::printf("announce: seed=%llu markets=%u books=%u\n",
+                    (unsigned long long)ann_seed, ann_markets, ann_books);
     std::printf("lost %llu datagrams, %llu reordered, %llu malformed\n",
                 (unsigned long long)gaps, (unsigned long long)reordered,
                 (unsigned long long)malformed);
     if (!out_path.empty())
-        std::printf("wrote capture to %s (markets=%u books=%u; seed/ticks not on the wire)\n",
-                    out_path.c_str(), max_market + 1, max_book + 1);
+        std::printf("wrote capture to %s (markets=%u books=%u; tick count not on the wire)\n",
+                    out_path.c_str(),
+                    have_announce ? ann_markets : max_market + 1,
+                    have_announce ? ann_books   : max_book + 1);
     return 0;
 }

@@ -1,8 +1,10 @@
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <random>
+#include <thread>
 #include <string>
 #include <vector>
 
@@ -52,6 +54,8 @@ struct Options {
     std::string settle_out;   // NEW: empty = don't record settlement
     std::string jumps_out;    // NEW: empty = don't record jump timeline
     std::string udp_target;   // NEW: empty = don't broadcast; else HOST:PORT
+    double pace_factor = 0.0; // NEW: 0 = unpaced. Else emit at this multiple
+                              // of real time (100 = 100x faster than live).
 };
 
 bool parse_args(int argc, char** argv, Options& opt) {
@@ -69,8 +73,9 @@ bool parse_args(int argc, char** argv, Options& opt) {
         else if (a == "--settle")   { auto v = next("--settle");  if (!v) return false; opt.settle_out = v; }
         else if (a == "--jumps")    { auto v = next("--jumps");   if (!v) return false; opt.jumps_out = v; }
         else if (a == "--udp")      { auto v = next("--udp");     if (!v) return false; opt.udp_target = v; }
+        else if (a == "--pace")     { auto v = next("--pace");    if (!v) return false; opt.pace_factor = std::strtod(v, nullptr); }
         else if (a == "--help") {
-            std::printf("usage: odds_sim [--seed N] [--markets N] [--ticks N] [--out PATH] [--truth PATH] [--settle PATH] [--jumps PATH] [--udp HOST:PORT]\n");
+            std::printf("usage: odds_sim [--seed N] [--markets N] [--ticks N] [--out PATH] [--truth PATH] [--settle PATH] [--jumps PATH] [--udp HOST:PORT] [--pace F]\n");
             return false;
         } else { std::fprintf(stderr, "unknown argument: %s\n", a.c_str()); return false; }
     }
@@ -139,7 +144,9 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "bad --udp target: %s (expected HOST:PORT)\n", opt.udp_target.c_str());
                 return 1;
             }
-            udp_sink = std::make_unique<UdpSink>(host, port);
+            udp_sink = std::make_unique<UdpSink>(
+                host, port, opt.seed, opt.markets,
+                static_cast<uint32_t>(roster.size()));
             // File first: the on-disk session completes even if the socket
             // errors, so --udp can never cost the artefact the replay gate
             // depends on.
@@ -160,9 +167,23 @@ int main(int argc, char** argv) {
     // market stream, so the session bytes are unchanged.
     std::vector<std::array<double, LatentMarket::kOutcomes>> final_latent(opt.markets);
 
+    // Pacing baseline. Sleeping is the ONLY thing this does: the wall clock is
+    // never read into a record, since sim_timestamp_ns stays tick x interval.
+    // So a paced run and an unpaced run produce byte-identical output, which is
+    // what keeps --pace compatible with the replay-determinism gate.
+    const auto pace_start = std::chrono::steady_clock::now();
+
     try {
         for (uint64_t tick = 0; tick < opt.ticks; ++tick) {
             const uint64_t ts = tick * kTickIntervalNs;
+
+            // Absolute target from a fixed baseline rather than a per-tick
+            // sleep_for: sleeping for a duration accumulates every overshoot,
+            // so a long run would drift steadily behind its own schedule.
+            if (opt.pace_factor > 0.0) {
+                std::this_thread::sleep_until(pace_start + std::chrono::nanoseconds(
+                    static_cast<int64_t>(static_cast<double>(ts) / opt.pace_factor)));
+            }
             for (uint32_t m = 0; m < opt.markets; ++m) {
                 auto& sim = sims[m];
                 const auto latent = sim.latent.step();

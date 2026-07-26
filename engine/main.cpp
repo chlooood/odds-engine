@@ -16,6 +16,7 @@
 #include "Kelly.hpp"
 #include "ReplayHash.hpp"
 #include "SessionReader.hpp"
+#include "UdpSource.hpp"
 
 namespace {
 
@@ -45,6 +46,9 @@ devig::DevigResult run_devig(DevigMethod m, std::span<const double> odds) {
 
 struct Options {
     std::string in = "data/session.bin";
+    uint16_t listen_port = 0;             // NEW: nonzero = consume a live UDP feed
+    long announce_timeout_ms = 10000;     // how long to wait for the feed's shape
+    long idle_ms = 5000;                  // silence this long ends a live run
     std::string bets_out;           // NEW: empty = don't emit a bet log
     bool hash = false;
     uint64_t stale_ms = 3000;
@@ -63,6 +67,9 @@ bool parse_args(int argc, char** argv, Options& opt) {
             return argv[++i];
         };
         if (a == "--in")                { auto v = next("--in");             if (!v) return false; opt.in = v; }
+        else if (a == "--listen")       { auto v = next("--listen");         if (!v) return false; opt.listen_port = static_cast<uint16_t>(std::strtoul(v, nullptr, 10)); }
+        else if (a == "--announce-timeout-ms") { auto v = next("--announce-timeout-ms"); if (!v) return false; opt.announce_timeout_ms = std::strtol(v, nullptr, 10); }
+        else if (a == "--idle-ms")      { auto v = next("--idle-ms");        if (!v) return false; opt.idle_ms = std::strtol(v, nullptr, 10); }
         else if (a == "--bets")         { auto v = next("--bets");           if (!v) return false; opt.bets_out = v; }
         else if (a == "--hash")         { opt.hash = true; }
         else if (a == "--stale-ms")     { auto v = next("--stale-ms");       if (!v) return false; opt.stale_ms = std::strtoull(v, nullptr, 10); }
@@ -78,7 +85,7 @@ bool parse_args(int argc, char** argv, Options& opt) {
         }
         else if (a == "--help") {
             opt.help = true;
-            std::printf("usage: odds_engine --in PATH [--bets PATH] [--hash]\n"
+            std::printf("usage: odds_engine (--in PATH | --listen PORT) [--bets PATH] [--hash]\n"
                         "                   [--devig multiplicative|power|shin]\n"
                         "                   [--kelly-fraction F] [--max-exposure F]\n"
                         "                   [--stale-ms N] [--summary-every N]\n"
@@ -93,26 +100,36 @@ bool parse_args(int argc, char** argv, Options& opt) {
                         "  --max-exposure F   cap on total staked fraction per market-tick (default 0.05).\n"
                         "  --hash             print one FNV-1a digest of the whole fair-price trajectory.\n"
                         "  --devig METHOD     devig method feeding consensus (default: shin).\n"
+                        "  --listen PORT      consume a live odds_sim --udp feed instead of a file.\n"
+                        "                     Incompatible with --hash: see below.\n"
+                        "  --idle-ms N        end a live run after N ms of silence (default 5000).\n"
                         "  --stale-ms N       exclude a book quoting older than N ms (default 3000).\n"
                         "  --summary-every N  print a summary line every N ticks (default 1000).\n");
             return true;
         } else { std::fprintf(stderr, "unknown argument: %s\n", a.c_str()); return false; }
     }
+    // --hash is a REGRESSION fingerprint: it means anything only because every
+    // record is present, so the same seed yields the same digest. A live feed
+    // drops datagrams nondeterministically, so two runs of one seed would
+    // legitimately differ. Printing a digest nobody can compare would be worse
+    // than refusing, because it looks like a guarantee.
+    if (opt.hash && opt.listen_port != 0) {
+        std::fprintf(stderr, "--hash cannot be used with --listen: a lossy feed has no reproducible digest\n");
+        return false;
+    }
     return true;
 }
 
-} // namespace
-
-int main(int argc, char** argv) {
-    Options opt;
-    if (!parse_args(argc, argv, opt)) return 1;
-    if (opt.help) return 0;
-
+// Templated on the source, not taking an interface: SessionReader and
+// UdpSource expose the same header()/next() pair, and templating keeps the
+// engine read path free of virtual calls. That rule is why the simulator's
+// OutputSink is allowed a vtable and this is not.
+template <class Source>
+int run(Source& src, const Options& opt) {
     const uint64_t stale_ns = opt.stale_ms * 1'000'000ULL;
 
     try {
-        SessionReader reader(opt.in);
-        const auto& h = reader.header();
+        const auto& h = src.header();
 
         if (h.markets > Table::max_markets()) {
             std::fprintf(stderr, "session has %u markets, engine table holds %zu\n", h.markets, Table::max_markets());
@@ -215,7 +232,7 @@ int main(int argc, char** argv) {
         };
 
         OddsUpdate u{};
-        while (reader.next(u)) {
+        while (src.next(u)) {
             if (have_tick && u.sim_timestamp_ns != cur_ts) process_tick(cur_ts);
             cur_ts = u.sim_timestamp_ns;
             have_tick = true;
@@ -238,4 +255,42 @@ int main(int argc, char** argv) {
         }
         return 0;
     } catch (const std::exception& e) { std::fprintf(stderr, "error: %s\n", e.what()); return 1; }
+}
+
+} // namespace
+
+int main(int argc, char** argv) {
+    Options opt;
+    if (!parse_args(argc, argv, opt)) return 1;
+    if (opt.help) return 0;
+
+    if (opt.listen_port != 0) {
+        try {
+            UdpSource src(opt.listen_port, opt.announce_timeout_ms, opt.idle_ms);
+            std::printf("feed: seed=%llu markets=%u books=%u (from announce)\n",
+                        (unsigned long long)src.header().seed,
+                        src.header().markets, src.header().books);
+            const int rc = run(src, opt);
+            // Reported unconditionally, including the zero case: "0 lost" is
+            // information about the run, not the absence of information.
+            std::printf("feed: %llu datagrams (%llu announces), %llu records, "
+                        "%llu lost, %llu reordered, %llu malformed, %llu pre-announce discarded\n",
+                        (unsigned long long)src.datagrams(), (unsigned long long)src.announces(),
+                        (unsigned long long)src.records(), (unsigned long long)src.lost(),
+                        (unsigned long long)src.reordered(), (unsigned long long)src.malformed(),
+                        (unsigned long long)src.pre_announce_discarded());
+            return rc;
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "error: %s\n", e.what());
+            return 1;
+        }
+    }
+
+    try {
+        SessionReader reader(opt.in);
+        return run(reader, opt);
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "error: %s\n", e.what());
+        return 1;
+    }
 }

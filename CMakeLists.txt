@@ -16,6 +16,7 @@ add_executable(odds_sim sim/main.cpp)
 add_executable(odds_engine engine/main.cpp)
 add_executable(verify_session tools/verify_session.cpp)
 add_executable(validate_devig tools/validate_devig.cpp)
+add_executable(udp_listen tools/udp_listen.cpp)
 add_executable(scratch_latent tests/scratch_latent.cpp)
 add_executable(scratch_books  tests/scratch_books.cpp)
 

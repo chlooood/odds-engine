@@ -47,3 +47,11 @@ jobs:
           echo "seed42=$H1 seed42=$H2 seed43=$H3"
           test "$H1" = "$H2" || { echo "same seed produced different engine digest"; exit 1; }
           test "$H1" != "$H3" || { echo "different seeds produced identical engine digest"; exit 1; }
+
+      - name: UDP tee does not perturb the session file
+        run: |
+          mkdir -p data
+          ./build/odds_sim --seed 42 --markets 5 --ticks 2000 --out data/tee_off.bin
+          ./build/odds_sim --seed 42 --markets 5 --ticks 2000 --out data/tee_on.bin \
+            --udp 127.0.0.1:9999
+          cmp data/tee_off.bin data/tee_on.bin

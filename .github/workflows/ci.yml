@@ -68,3 +68,26 @@ jobs:
           if ./build/odds_engine --listen 9100 --hash; then
             echo "engine accepted --hash with --listen"; exit 1
           fi
+
+      - name: Dashboard cannot influence the replay digest
+        run: |
+          mkdir -p data
+          ./build/odds_sim --seed 42 --markets 5 --ticks 2000 --out data/ws_det.bin
+          A=$(./build/odds_engine --in data/ws_det.bin --hash)
+          B=$(./build/odds_engine --in data/ws_det.bin --hash --ws 8081)
+          echo "no-ws=$A ws=$B"
+          test "$A" = "$B"
+
+      - name: WebSocket handshake matches the RFC 6455 vector
+        run: |
+          ./build/odds_sim --seed 42 --markets 2 --ticks 3000 --out data/ws_hs.bin \
+            --udp 127.0.0.1:9400 --pace 300 &
+          sleep 1
+          ./build/odds_engine --listen 9400 --ws 8082 --summary-every 0 --idle-ms 2000 &
+          sleep 2
+          ACCEPT=$(curl -s -i -N -H "Connection: Upgrade" -H "Upgrade: websocket" \
+            -H "Sec-WebSocket-Version: 13" -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
+            http://127.0.0.1:8082/ | grep -i '^Sec-WebSocket-Accept:' | tr -d '\r' | awk '{print $2}')
+          echo "accept=$ACCEPT"
+          test "$ACCEPT" = "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+          wait

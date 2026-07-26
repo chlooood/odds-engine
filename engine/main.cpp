@@ -1,3 +1,4 @@
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -17,6 +18,7 @@
 #include "ReplayHash.hpp"
 #include "SessionReader.hpp"
 #include "UdpSource.hpp"
+#include "WsServer.hpp"
 
 namespace {
 
@@ -49,6 +51,9 @@ struct Options {
     uint16_t listen_port = 0;             // NEW: nonzero = consume a live UDP feed
     long announce_timeout_ms = 10000;     // how long to wait for the feed's shape
     long idle_ms = 5000;                  // silence this long ends a live run
+    uint16_t ws_port = 0;                 // NEW: nonzero = serve a dashboard feed
+    long ws_interval_ms = 100;            // min wall-clock gap between pushes
+    uint32_t ws_markets = 20;             // markets included per push
     std::string bets_out;           // NEW: empty = don't emit a bet log
     bool hash = false;
     uint64_t stale_ms = 3000;
@@ -70,6 +75,9 @@ bool parse_args(int argc, char** argv, Options& opt) {
         else if (a == "--listen")       { auto v = next("--listen");         if (!v) return false; opt.listen_port = static_cast<uint16_t>(std::strtoul(v, nullptr, 10)); }
         else if (a == "--announce-timeout-ms") { auto v = next("--announce-timeout-ms"); if (!v) return false; opt.announce_timeout_ms = std::strtol(v, nullptr, 10); }
         else if (a == "--idle-ms")      { auto v = next("--idle-ms");        if (!v) return false; opt.idle_ms = std::strtol(v, nullptr, 10); }
+        else if (a == "--ws")           { auto v = next("--ws");             if (!v) return false; opt.ws_port = static_cast<uint16_t>(std::strtoul(v, nullptr, 10)); }
+        else if (a == "--ws-interval-ms"){auto v = next("--ws-interval-ms"); if (!v) return false; opt.ws_interval_ms = std::strtol(v, nullptr, 10); }
+        else if (a == "--ws-markets")   { auto v = next("--ws-markets");      if (!v) return false; opt.ws_markets = static_cast<uint32_t>(std::strtoul(v, nullptr, 10)); }
         else if (a == "--bets")         { auto v = next("--bets");           if (!v) return false; opt.bets_out = v; }
         else if (a == "--hash")         { opt.hash = true; }
         else if (a == "--stale-ms")     { auto v = next("--stale-ms");       if (!v) return false; opt.stale_ms = std::strtoull(v, nullptr, 10); }
@@ -103,6 +111,9 @@ bool parse_args(int argc, char** argv, Options& opt) {
                         "  --listen PORT      consume a live odds_sim --udp feed instead of a file.\n"
                         "                     Incompatible with --hash: see below.\n"
                         "  --idle-ms N        end a live run after N ms of silence (default 5000).\n"
+                        "  --ws PORT          serve a live dashboard on http://127.0.0.1:PORT\n"
+                        "  --ws-interval-ms N min gap between dashboard pushes (default 100).\n"
+                        "  --ws-markets N     markets per dashboard push (default 20).\n"
                         "  --stale-ms N       exclude a book quoting older than N ms (default 3000).\n"
                         "  --summary-every N  print a summary line every N ticks (default 1000).\n");
             return true;
@@ -142,6 +153,20 @@ int run(Source& src, const Options& opt) {
 
         Table table;
         ReplayHash hash;
+
+        // The dashboard is a VIEW, never a participant: it reads fair prices
+        // after they are computed and cannot influence consensus, sizing, or
+        // the digest. The wall-clock read below gates only what leaves on a
+        // socket, which is why --ws and --hash coexist safely.
+        std::unique_ptr<ws::Server> wsrv;
+        if (opt.ws_port != 0) {
+            wsrv = std::make_unique<ws::Server>(opt.ws_port);
+            std::printf("dashboard: http://127.0.0.1:%u\n", opt.ws_port);
+            std::fflush(stdout);
+        }
+        auto ws_last = std::chrono::steady_clock::now();
+        std::string ws_json;
+        uint64_t ws_pushes = 0;
         uint64_t consensus_count = 0;
         uint64_t no_price_count = 0;
         uint64_t bets_placed = 0;
@@ -156,6 +181,24 @@ int run(Source& src, const Options& opt) {
 
         auto process_tick = [&](uint64_t ts) {
             const uint64_t tick = ts / kTickIntervalNs;
+
+            // Throttled on wall clock, not ticks: under --pace 100 a tick is
+            // 1ms, and no browser renders usefully at 1000 Hz. Decided once
+            // per tick so the per-market loop below stays branch-free of it.
+            bool ws_push = false;
+            if (wsrv) {
+                wsrv->service();
+                const auto now = std::chrono::steady_clock::now();
+                if (std::chrono::duration_cast<std::chrono::milliseconds>(now - ws_last).count()
+                        >= opt.ws_interval_ms && wsrv->client_count() > 0) {
+                    ws_last = now;
+                    ws_push = true;
+                    ws_json.assign("{\"t\":");
+                    ws_json += std::to_string(tick);
+                    ws_json += ",\"m\":[";
+                }
+            }
+            bool ws_first = true;
             for (uint16_t m = 0; m < static_cast<uint16_t>(h.markets); ++m) {
                 // Best available (highest) odds per outcome across non-stale books:
                 // the actual price you could bet into right now. Tracked alongside
@@ -219,6 +262,18 @@ int run(Source& src, const Options& opt) {
                     }
                 }
 
+                if (ws_push && m < opt.ws_markets) {
+                    if (!ws_first) ws_json += ',';
+                    ws_first = false;
+                    char buf[192];
+                    int off = std::snprintf(buf, sizeof(buf), "{\"i\":%u,\"p\":[", m);
+                    for (int i = 0; i < fair.count; ++i)
+                        off += std::snprintf(buf + off, sizeof(buf) - off,
+                                             "%s%.6f", i ? "," : "", fair.prob[i]);
+                    std::snprintf(buf + off, sizeof(buf) - off, "],\"b\":%zu}", fair.books_used);
+                    ws_json += buf;
+                }
+
                 if (opt.hash) {
                     hash.mix_u16(m);
                     hash.mix_bytes(&fair.count, sizeof(fair.count));
@@ -228,6 +283,11 @@ int run(Source& src, const Options& opt) {
                     for (int i = 0; i < fair.count; ++i) std::printf(" %.4f", fair.prob[i]);
                     std::printf("  (%zu books)\n", fair.books_used);
                 }
+            }
+            if (ws_push) {
+                ws_json += "]}";
+                wsrv->broadcast(ws_json);
+                ++ws_pushes;
             }
         };
 
@@ -252,6 +312,12 @@ int run(Source& src, const Options& opt) {
                         (unsigned long long)table.rejected_stale_seq());
             if (betlog) std::printf(", %llu bets logged", (unsigned long long)bets_placed);
             std::printf("\n");
+            if (wsrv)
+                std::printf("dashboard: %llu pushes, %llu frames dropped to slow clients, "
+                            "%llu pages served\n",
+                            (unsigned long long)ws_pushes,
+                            (unsigned long long)wsrv->dropped(),
+                            (unsigned long long)wsrv->served_pages());
         }
         return 0;
     } catch (const std::exception& e) { std::fprintf(stderr, "error: %s\n", e.what()); return 1; }

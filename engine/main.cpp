@@ -1,5 +1,7 @@
 #include <chrono>
+#include <cmath>
 #include <cstdio>
+#include <functional>
 #include <cstdlib>
 #include <cstring>
 #include <array>
@@ -44,6 +46,28 @@ devig::DevigResult run_devig(DevigMethod m, std::span<const double> odds) {
         case DevigMethod::Shin:           return devig::shin(odds);
     }
     return {};
+}
+
+// The parameters a running engine will accept changes to, separated from
+// Options so the boundary is visible in the type rather than in a comment.
+// Everything NOT here is immutable mid-run by construction: seed, markets, and
+// books belong to the source and changing them would invalidate the table
+// sizing and every seq_no gate built on it.
+struct LiveConfig {
+    uint64_t stale_ms;
+    double kelly_fraction;
+    double max_exposure;
+    DevigMethod devig_method;
+    uint64_t changes = 0;
+};
+
+const char* devig_name(DevigMethod m) {
+    switch (m) {
+        case DevigMethod::Multiplicative: return "multiplicative";
+        case DevigMethod::Power:          return "power";
+        case DevigMethod::Shin:           return "shin";
+    }
+    return "?";
 }
 
 struct Options {
@@ -131,13 +155,86 @@ bool parse_args(int argc, char** argv, Options& opt) {
     return true;
 }
 
+// Applies one live-configuration command, returning the JSON to send back.
+//
+// Every accepted key is RANGE-CHECKED, not merely parsed. A kelly-fraction of
+// 100 would parse fine and then stake a hundred times the bankroll; the bounds
+// here are the difference between a control panel and a foot-gun.
+std::string apply_command(const std::string& msg, LiveConfig& cfg, bool hash_mode) {
+    auto nack = [](const std::string& key, const std::string& why) {
+        return "{\"ok\":false,\"key\":\"" + key + "\",\"error\":\"" + why + "\"}";
+    };
+
+    std::string cmd;
+    if (!ws::json_string(msg, "cmd", cmd)) return nack("", "malformed command");
+    if (cmd != "set") return nack(cmd, "unknown command");
+
+    std::string key;
+    if (!ws::json_string(msg, "key", key)) return nack("", "missing key");
+
+    // --hash promises that one seed yields one digest. A config change mid-run
+    // would break that silently, so the lock is absolute rather than advisory.
+    if (hash_mode) return nack(key, "configuration is locked in --hash mode");
+
+    if (key == "devig") {
+        std::string v;
+        if (!ws::json_string(msg, "value", v)) return nack(key, "value must be a string");
+        DevigMethod m;
+        if (!parse_devig(v, m)) return nack(key, "expected multiplicative, power, or shin");
+        cfg.devig_method = m;
+        ++cfg.changes;
+        return "{\"ok\":true,\"key\":\"devig\",\"value\":\"" + v + "\"}";
+    }
+
+    double v = 0.0;
+    if (!ws::json_number(msg, "value", v)) return nack(key, "value must be a number");
+    if (!std::isfinite(v)) return nack(key, "value must be finite");
+
+    char buf[128];
+    if (key == "stale-ms") {
+        // Upper bound of an hour: beyond that "stale" stops excluding anything
+        // and the staleness gate silently becomes a no-op.
+        if (v < 1.0 || v > 3'600'000.0) return nack(key, "expected 1 to 3600000");
+        cfg.stale_ms = static_cast<uint64_t>(v);
+        ++cfg.changes;
+        std::snprintf(buf, sizeof(buf),
+            "{\"ok\":true,\"key\":\"stale-ms\",\"value\":%llu}",
+            (unsigned long long)cfg.stale_ms);
+        return buf;
+    }
+    if (key == "kelly-fraction") {
+        if (!(v > 0.0) || v > 1.0) return nack(key, "expected 0 < value <= 1");
+        cfg.kelly_fraction = v;
+        ++cfg.changes;
+        std::snprintf(buf, sizeof(buf),
+            "{\"ok\":true,\"key\":\"kelly-fraction\",\"value\":%.4f}", v);
+        return buf;
+    }
+    if (key == "max-exposure") {
+        if (!(v > 0.0) || v > 1.0) return nack(key, "expected 0 < value <= 1");
+        cfg.max_exposure = v;
+        ++cfg.changes;
+        std::snprintf(buf, sizeof(buf),
+            "{\"ok\":true,\"key\":\"max-exposure\",\"value\":%.4f}", v);
+        return buf;
+    }
+
+    // Named explicitly rather than falling through to "unknown": a caller
+    // trying to change the seed has a wrong mental model, and saying so is
+    // more useful than pretending the key does not exist.
+    if (key == "seed" || key == "markets" || key == "books" || key == "ticks")
+        return nack(key, "immutable mid-run: belongs to the feed, not the engine");
+
+    return nack(key, "unknown key");
+}
+
 // Templated on the source, not taking an interface: SessionReader and
 // UdpSource expose the same header()/next() pair, and templating keeps the
 // engine read path free of virtual calls. That rule is why the simulator's
 // OutputSink is allowed a vtable and this is not.
 template <class Source>
 int run(Source& src, const Options& opt) {
-    const uint64_t stale_ns = opt.stale_ms * 1'000'000ULL;
+    LiveConfig cfg{opt.stale_ms, opt.kelly_fraction, opt.max_exposure, opt.devig_method, 0};
 
     try {
         const auto& h = src.header();
@@ -161,8 +258,12 @@ int run(Source& src, const Options& opt) {
         std::unique_ptr<ws::Server> wsrv;
         if (opt.ws_port != 0) {
             wsrv = std::make_unique<ws::Server>(opt.ws_port);
-            std::printf("dashboard: http://127.0.0.1:%u\n", opt.ws_port);
-            std::fflush(stdout);
+            wsrv->set_command_handler([&](const std::string& msg) -> std::string {
+                return apply_command(msg, cfg, opt.hash);
+            });
+            // stderr, not stdout: in --hash mode stdout carries the digest
+            // and nothing else, so a caller can capture it with $(...).
+            std::fprintf(stderr, "dashboard: http://127.0.0.1:%u\n", opt.ws_port);
         }
         auto ws_last = std::chrono::steady_clock::now();
         std::string ws_json;
@@ -195,6 +296,17 @@ int run(Source& src, const Options& opt) {
                     ws_push = true;
                     ws_json.assign("{\"t\":");
                     ws_json += std::to_string(tick);
+                    // Config rides along on every push rather than being
+                    // broadcast on change: one message type instead of two, and
+                    // self-correcting - a tab that misses one push is fixed by
+                    // the next, where a missed broadcast would leave it wrong
+                    // indefinitely.
+                    char cbuf[192];
+                    std::snprintf(cbuf, sizeof(cbuf),
+                        ",\"c\":{\"stale_ms\":%llu,\"kelly\":%.4f,\"exposure\":%.4f,\"devig\":\"%s\"}",
+                        (unsigned long long)cfg.stale_ms, cfg.kelly_fraction,
+                        cfg.max_exposure, devig_name(cfg.devig_method));
+                    ws_json += cbuf;
                     ws_json += ",\"m\":[";
                 }
             }
@@ -208,7 +320,7 @@ int run(Source& src, const Options& opt) {
                 for (uint16_t b = 0; b < static_cast<uint16_t>(h.books); ++b) {
                     consensus::BookInput& in = inputs[b];
                     in = consensus::BookInput{};
-                    if (table.is_stale(m, b, ts, stale_ns)) continue;
+                    if (table.is_stale(m, b, ts, cfg.stale_ms * 1'000'000ULL)) continue;
 
                     const auto& q = table.get(m, b);
                     const int n = q.outcome_count;
@@ -218,7 +330,7 @@ int run(Source& src, const Options& opt) {
                     std::array<double, devig::kMaxOutcomes> odds{};
                     for (int i = 0; i < n; ++i) odds[i] = q.odds_milli[i] / 1000.0;
 
-                    const auto r = run_devig(opt.devig_method, std::span<const double>(odds.data(), n));
+                    const auto r = run_devig(cfg.devig_method, std::span<const double>(odds.data(), n));
                     if (!r.usable_as_distribution()) continue;
 
                     in.count = r.count;
@@ -244,7 +356,7 @@ int run(Source& src, const Options& opt) {
                         const auto alloc = kelly::allocate(
                             std::span<const double>(fair.prob.data(), fair.count),
                             std::span<const double>(best_dec.data(), fair.count),
-                            opt.kelly_fraction, opt.max_exposure);
+                            cfg.kelly_fraction, cfg.max_exposure);
                         if (alloc.has_bet) {
                             for (int i = 0; i < fair.count; ++i) {
                                 if (alloc.stake[i] <= 0.0) continue;
@@ -314,10 +426,12 @@ int run(Source& src, const Options& opt) {
             std::printf("\n");
             if (wsrv)
                 std::printf("dashboard: %llu pushes, %llu frames dropped to slow clients, "
-                            "%llu pages served\n",
+                            "%llu pages served, %llu commands received, %llu config changes applied\n",
                             (unsigned long long)ws_pushes,
                             (unsigned long long)wsrv->dropped(),
-                            (unsigned long long)wsrv->served_pages());
+                            (unsigned long long)wsrv->served_pages(),
+                            (unsigned long long)wsrv->commands_received(),
+                            (unsigned long long)cfg.changes);
         }
         return 0;
     } catch (const std::exception& e) { std::fprintf(stderr, "error: %s\n", e.what()); return 1; }

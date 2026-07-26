@@ -91,3 +91,23 @@ jobs:
           echo "accept=$ACCEPT"
           test "$ACCEPT" = "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
           wait
+
+      - name: Live config lock in --hash mode
+        run: |
+          mkdir -p data
+          ./build/odds_sim --seed 42 --markets 5 --ticks 50000 --out data/ci_hash_long.bin
+          ./build/odds_engine --in data/ci_hash_long.bin --hash --ws 8083 &
+          sleep 2
+          REPLY=$(python3 tools/ws_cmd.py 8083 set kelly-fraction 0.5)
+          echo "reply=$REPLY"
+          echo "$REPLY" | grep -q '"ok":false'
+          wait
+
+      - name: Live config does not influence the replay digest
+        run: |
+          mkdir -p data
+          ./build/odds_sim --seed 42 --markets 5 --ticks 2000 --out data/ci_cfg_det.bin
+          A=$(./build/odds_engine --in data/ci_cfg_det.bin --hash)
+          B=$(./build/odds_engine --in data/ci_cfg_det.bin --hash --ws 8084)
+          echo "no-ws=$A ws=$B"
+          test "$A" = "$B"

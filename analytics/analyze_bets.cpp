@@ -8,6 +8,7 @@
 #include <unordered_map>
 
 #include "../proto/messages.hpp"
+#include "../proto/timing.hpp"
 #include "../engine/SessionReader.hpp"
 #include "../engine/BetLog.hpp"
 #include "../sim/SettlementSink.hpp"
@@ -24,7 +25,6 @@
 //              the edge estimate is the jump count, not the (vast) bet count.
 
 namespace {
-constexpr uint64_t kTickIntervalNs = 100'000'000ULL; // must match the simulator
 
 struct Args {
     std::string bets, session, settle, jumps;

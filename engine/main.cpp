@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "../proto/messages.hpp"
+#include "../proto/timing.hpp"
 #include "BetLog.hpp"
 #include "BookTable.hpp"
 #include "Consensus.hpp"
@@ -20,7 +21,6 @@ namespace {
 
 // Must match the simulator's tick interval; used only to turn a timestamp back
 // into a human-readable tick number for summary output.
-constexpr uint64_t kTickIntervalNs = 100'000'000ULL; // 100 ms
 constexpr uint32_t kMinOddsMilli = 1001;              // a real, bettable quote
 
 using Table = BookTable<1024, 16>;

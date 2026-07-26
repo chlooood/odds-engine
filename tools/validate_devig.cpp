@@ -9,7 +9,7 @@
 #include "../engine/SessionReader.hpp"
 #include "../engine/TruthReader.hpp"
 #include "../proto/messages.hpp"
-constexpr uint64_t kTickIntervalNs = 100'000'000ULL; // 100 ms
+#include "../proto/timing.hpp"
 
 // Measures how accurately each devig method in engine/Devig.hpp recovers the
 // latent probability that generated a session's prices. See

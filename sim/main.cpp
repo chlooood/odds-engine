@@ -7,9 +7,12 @@
 #include <vector>
 
 #include "../proto/messages.hpp"
+#include "../proto/timing.hpp"
 #include "Bookmaker.hpp"
 #include "LatentMarket.hpp"
 #include "OutputSink.hpp"
+#include "UdpSink.hpp"
+#include "FanoutSink.hpp"
 #include "JumpSink.hpp"
 #include "Seeding.hpp"
 #include "SettlementSink.hpp"
@@ -17,7 +20,6 @@
 
 namespace {
 
-constexpr uint64_t kTickIntervalNs = 100'000'000ULL; // 100 ms
 
 struct SimBookConfig { BookConfig cfg; int update_interval_ticks; };
 
@@ -49,6 +51,7 @@ struct Options {
     std::string truth_out;
     std::string settle_out;   // NEW: empty = don't record settlement
     std::string jumps_out;    // NEW: empty = don't record jump timeline
+    std::string udp_target;   // NEW: empty = don't broadcast; else HOST:PORT
 };
 
 bool parse_args(int argc, char** argv, Options& opt) {
@@ -65,13 +68,27 @@ bool parse_args(int argc, char** argv, Options& opt) {
         else if (a == "--truth")    { auto v = next("--truth");   if (!v) return false; opt.truth_out = v; }
         else if (a == "--settle")   { auto v = next("--settle");  if (!v) return false; opt.settle_out = v; }
         else if (a == "--jumps")    { auto v = next("--jumps");   if (!v) return false; opt.jumps_out = v; }
+        else if (a == "--udp")      { auto v = next("--udp");     if (!v) return false; opt.udp_target = v; }
         else if (a == "--help") {
-            std::printf("usage: odds_sim [--seed N] [--markets N] [--ticks N] [--out PATH] [--truth PATH] [--settle PATH] [--jumps PATH]\n");
+            std::printf("usage: odds_sim [--seed N] [--markets N] [--ticks N] [--out PATH] [--truth PATH] [--settle PATH] [--jumps PATH] [--udp HOST:PORT]\n");
             return false;
         } else { std::fprintf(stderr, "unknown argument: %s\n", a.c_str()); return false; }
     }
     if (opt.markets == 0 || opt.ticks == 0) { std::fprintf(stderr, "markets and ticks must be > 0\n"); return false; }
     if (opt.markets > kMaxMarketsSupported) { std::fprintf(stderr, "markets exceeds supported maximum (%u)\n", kMaxMarketsSupported); return false; }
+    return true;
+}
+
+// Splits HOST:PORT. IPv4 literal only; no name resolution, deliberately -
+// a DNS lookup in the startup path is one more thing that can behave
+// differently between runs.
+bool split_host_port(const std::string& s, std::string& host, uint16_t& port) {
+    const auto colon = s.rfind(':');
+    if (colon == std::string::npos || colon == 0 || colon + 1 >= s.size()) return false;
+    host = s.substr(0, colon);
+    const unsigned long p = std::strtoul(s.c_str() + colon + 1, nullptr, 10);
+    if (p == 0 || p > 65535) return false;
+    port = static_cast<uint16_t>(p);
     return true;
 }
 
@@ -107,11 +124,29 @@ int main(int argc, char** argv) {
     header.seed = opt.seed; header.markets = opt.markets;
     header.books = static_cast<uint32_t>(roster.size()); header.ticks = opt.ticks;
 
-    std::unique_ptr<FileSink> sink;
+    std::unique_ptr<FileSink> file_sink;
+    std::unique_ptr<UdpSink> udp_sink;
+    std::unique_ptr<FanoutSink> fanout;
     std::unique_ptr<TruthSink> truth;
     std::unique_ptr<JumpSink> jumps;
+    OutputSink* sink = nullptr;
     try {
-        sink = std::make_unique<FileSink>(opt.out, header);
+        file_sink = std::make_unique<FileSink>(opt.out, header);
+        sink = file_sink.get();
+        if (!opt.udp_target.empty()) {
+            std::string host; uint16_t port = 0;
+            if (!split_host_port(opt.udp_target, host, port)) {
+                std::fprintf(stderr, "bad --udp target: %s (expected HOST:PORT)\n", opt.udp_target.c_str());
+                return 1;
+            }
+            udp_sink = std::make_unique<UdpSink>(host, port);
+            // File first: the on-disk session completes even if the socket
+            // errors, so --udp can never cost the artefact the replay gate
+            // depends on.
+            fanout = std::make_unique<FanoutSink>(
+                std::vector<OutputSink*>{file_sink.get(), udp_sink.get()});
+            sink = fanout.get();
+        }
         if (!opt.truth_out.empty()) truth = std::make_unique<TruthSink>(opt.truth_out);
         if (!opt.jumps_out.empty()) jumps = std::make_unique<JumpSink>(opt.jumps_out, opt.seed, opt.markets);
     } catch (const std::exception& e) { std::fprintf(stderr, "error: %s\n", e.what()); return 1; }
@@ -181,9 +216,14 @@ int main(int argc, char** argv) {
     } catch (const std::exception& e) { std::fprintf(stderr, "error during generation: %s\n", e.what()); return 1; }
 
     std::printf("wrote %llu records to %s (seed=%llu markets=%u books=%zu ticks=%llu)%s\n",
-                static_cast<unsigned long long>(sink->record_count()), opt.out.c_str(),
+                static_cast<unsigned long long>(file_sink->record_count()), opt.out.c_str(),
                 static_cast<unsigned long long>(opt.seed), opt.markets,
                 roster.size(), static_cast<unsigned long long>(opt.ticks),
                 opt.settle_out.empty() ? "" : " +settlement");
+    if (udp_sink)
+        std::printf("broadcast %llu datagrams to %s (%llu send errors)\n",
+                    static_cast<unsigned long long>(udp_sink->datagrams_sent()),
+                    opt.udp_target.c_str(),
+                    static_cast<unsigned long long>(udp_sink->send_errors()));
     return 0;
 }
